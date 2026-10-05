@@ -21,7 +21,7 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "playback-kit"
+rootProject.name = "playbackkit"
 include(":playback")
 // The sample app: never published, never a dependency of the library.
 include(":sample")

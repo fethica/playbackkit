@@ -37,7 +37,7 @@ import java.io.ByteArrayOutputStream
 
 /**
  * The sample's own media session service. **Sample-owned, not part of the library**:
- * playback-kit ships no service, no player and no notification. This is the code a host
+ * playbackkit ships no service, no player and no notification. This is the code a host
  * app writes around [PlaybackRecovery]:
  *
  * - it owns one [ExoPlayer], built on the main looper, which is the player's application

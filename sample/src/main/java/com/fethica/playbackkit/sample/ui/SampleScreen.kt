@@ -76,7 +76,7 @@ fun SampleScreen(controller: Player?, onOpenPanel: () -> Unit) {
                 .padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("playback-kit sample", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                Text("playbackkit sample", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
                 if (BuildConfig.DEBUG) TextButton(onClick = onOpenPanel) { Text("Developer") }
             }
             if (controller == null) {

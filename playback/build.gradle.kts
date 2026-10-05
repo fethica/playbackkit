@@ -51,11 +51,11 @@ publishing {
     publications {
         register<MavenPublication>("release") {
             groupId = project.group.toString()
-            artifactId = "playback-kit"
+            artifactId = "playbackkit"
             version = project.version.toString()
             afterEvaluate { from(components["release"]) }
             pom {
-                name.set("playback-kit")
+                name.set("playbackkit")
                 description.set("Playback recovery for Media3 players: retry ladders, watchdogs and suppression-aware waiting")
                 licenses { license { name.set("MIT") } }
             }

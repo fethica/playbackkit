@@ -1,10 +1,26 @@
-# playback-kit
+# playbackkit
 
 Playback recovery for Media3 players on Android. It keeps a player going through the failures a streaming app actually meets: dropped connections, servers that stop answering, streams that stall in READY, and a device that goes offline and comes back.
 
-Media3 already retries each failed load. playback-kit is the outer loop that runs after Media3 gives up, and it knows that a live item and a finite item recover differently.
+Media3 already retries each failed load. playbackkit is the outer loop that runs after Media3 gives up, and it knows that a live item and a finite item recover differently.
 
-Nothing is published yet. Build it from source.
+## Install
+
+No version is tagged yet. The library comes from JitPack, under the repository's own name: the Gradle group is `com.github.fethica` and the artifact is `playbackkit`. Until a tag exists, a commit hash is the version.
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        maven("https://jitpack.io")
+    }
+}
+
+// build.gradle.kts
+dependencies {
+    implementation("com.github.fethica:playbackkit:<version>")
+}
+```
 
 ## What it does
 
@@ -147,7 +163,7 @@ The panel also shows each path's scenario and request count, the server address,
 
 ## Requirements
 
-- Android 7.0+ (API 24); compileSdk 36
+- Android 7.0+ (API 24); the library is built against compileSdk 36 with minor API level 1 (`release(36) { minorApiLevel = 1 }`), so a source or JitPack build needs the Android 36.1 platform; a consumer compiles against the published AAR with its own compileSdk 36 or later
 - Media3 1.9.2
 
 ## License
