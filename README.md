@@ -14,7 +14,7 @@ Nothing is published yet. Build it from source.
 - **Suppression**: while a call or a navigation prompt suppresses playback, the buffering and stall watchdogs record no failure, and a rung that comes due waits until the suppression lifts. A player error or a network arrival during the suppression still enters recovery: it counts and schedules the next rung as usual, and that rung then waits.
 - **Pauses**: a pause the listener asked for, a headset unplug, a remote pause or a permanent focus loss ends recovery. A delayed retry re-checks play intent before it runs.
 - **Network**: offline failures wait for a network arrival instead of retrying blind. An arrival schedules the next rung of the ladder (for a live item deep in the ladder that can be up to 30 seconds away), it does not re-prepare on the spot. Arrivals can be signalled from any thread.
-- **Stable playback**: the ladder never resets on a READY blip. Every READY starts a 30 second wall-clock window, cancelled by a failure, a seek or a new item; when it ends, the ladder resets if the player is playing at that moment. Time spent paused inside the window counts.
+- **Stable playback**: the ladder never resets on a READY blip. Every READY starts a 30 second wall-clock window, cancelled by a failure, a new item or, for a finite item, a seek; when it ends, the ladder resets if the player is playing at that moment. Time spent paused inside the window counts.
 
 ## Usage
 
