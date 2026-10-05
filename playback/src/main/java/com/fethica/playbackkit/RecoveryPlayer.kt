@@ -19,6 +19,13 @@ internal interface RecoveryPlayer {
     val currentUri: String?
     val currentPosition: Long
 
+    /**
+     * An identity for the current item's place in the playlist, or null when empty. A new
+     * one appears the moment an item is set, even with the same media id, before any
+     * callback reports it; an in-place URI swap of the same entry may keep it.
+     */
+    val currentItemToken: Any?
+
     fun mediaIdAt(index: Int): String?
     fun uriAt(index: Int): String?
 

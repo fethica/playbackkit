@@ -6,6 +6,7 @@ import android.os.SystemClock
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.datasource.HttpDataSource
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -202,6 +203,17 @@ internal class Media3RecoveryPlayer(private val player: Player) : RecoveryPlayer
     override val currentMediaId: String? get() = player.currentMediaItem?.mediaId
     override val currentUri: String? get() = player.currentMediaItem?.localConfiguration?.uri?.toString()
     override val currentPosition: Long get() = player.currentPosition
+
+    private val window = Timeline.Window()
+
+    /** The window uid: every `setMediaItems` entry gets a new one, applied at once. */
+    override val currentItemToken: Any?
+        get() {
+            val timeline = player.currentTimeline
+            val index = player.currentMediaItemIndex
+            if (timeline.isEmpty || index !in 0 until timeline.windowCount) return null
+            return timeline.getWindow(index, window).uid
+        }
 
     override fun mediaIdAt(index: Int): String? = player.getMediaItemAt(index).mediaId
 

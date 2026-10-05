@@ -249,6 +249,118 @@ class LibraryTraceTest {
         assertFalse(result.log.any { "seekTo(0,10000)" in it })
     }
 
+    // The pre-start call at a failure's entry, made from inside the failing callback: the
+    // host's commands there queue their own callbacks behind it.
+
+    private val Trace.failureEvents: List<RecoveryEvent>
+        get() = events.filter {
+            it is RecoveryEvent.RungScheduled || it is RecoveryEvent.GaveUp ||
+                it is RecoveryEvent.FailureThresholdReached || it is RecoveryEvent.AwaitingNetwork
+        }
+
+    @Test fun `a replacement chosen inside the pre-start call at a failure's entry is neither stopped nor reported`() {
+        val result = runTrace(Impl.LIBRARY) {
+            select("live_a")
+            ready()
+            onBeforeStart = {
+                onBeforeStart = null
+                fake.setItem("live_b", uriOf("live_b"))
+                fake.prepare()
+                fake.play()
+            }
+            error(2004, 404)
+            assertEquals(emptyList<RecoveryEvent>(), failureEvents)
+            assertEquals(0, libraryEngine.snapshot().retryCount)
+            ready()
+            advance(10_000)
+        }
+        assertTrue(result.log.contains("t=0 host setMediaItems(live_b)"))
+        assertEquals(emptyList<String>(), result.recoveryCommands())
+        assertEquals(emptyList<String>(), result.reports())
+        val last = result.events.last() as RecoveryEvent.LadderReset
+        assertEquals("live_b", last.mediaId)
+        assertEquals(LadderResetCause.ITEM_CHANGED, last.cause)
+        assertTrue(result.finalPlayWhenReady)
+        assertTrue(result.finalState.contains("player=READY"))
+        assertTrue(result.finalState.contains("item=live_b"))
+    }
+
+    @Test fun `a seek inside the pre-start call at a failure's entry schedules no rung at the old position`() {
+        val result = runTrace(Impl.LIBRARY) {
+            select("finite_x")
+            ready()
+            advance(10_000)
+            onBeforeStart = {
+                onBeforeStart = null
+                fake.userSeek(2_000)
+            }
+            error(2001)
+            assertEquals(emptyList<RecoveryEvent>(), failureEvents)
+            advance(10_000)
+        }
+        assertTrue(result.log.contains("t=10000 host seekTo(0,2000)"))
+        assertEquals(emptyList<String>(), result.recoveryCommands())
+        assertFalse(result.log.any { "seekTo(0,10000)" in it })
+        assertTrue(result.events.any { it is RecoveryEvent.LadderReset && it.cause == LadderResetCause.USER_SEEK })
+        assertTrue(result.log.last().contains("attempts=0"))
+    }
+
+    @Test fun `a same-id reselection inside the pre-start call at a failure's entry is a new intent`() {
+        val hooks: List<FakePlayer.() -> Unit> = listOf(
+            // Same id, same URI, same position, still IDLE with the error: only the entry is new.
+            { setItem("live_a", uriOf("live_a")) },
+            {
+                setItem("live_a", uriOf("live_a"))
+                prepare()
+                play()
+            },
+        )
+        hooks.forEach { hook ->
+            val result = runTrace(Impl.LIBRARY) {
+                select("live_a")
+                ready()
+                val before = libraryEngine.generation
+                onBeforeStart = {
+                    onBeforeStart = null
+                    fake.hook()
+                    // Its transition callback is still queued: only the entry check counts it.
+                    assertEquals(before, libraryEngine.generation)
+                }
+                error(2001)
+                assertEquals(emptyList<RecoveryEvent>(), failureEvents)
+                assertEquals(0, libraryEngine.snapshot().retryCount)
+                assertEquals(0, libraryEngine.snapshot().failureCount)
+                assertFalse(libraryEngine.snapshot().retryPending)
+                // The entry check and the transition delivered after it each count once.
+                assertEquals(before + 2, libraryEngine.generation)
+                advance(10_000)
+            }
+            assertEquals(emptyList<String>(), result.recoveryCommands())
+            assertEquals(2, result.events.count { it is RecoveryEvent.LadderReset && it.mediaId == "live_a" })
+        }
+    }
+
+    @Test fun `a pre-start call at a failure's entry that changes nothing still stops a permanent failure`() {
+        var calls = 0
+        val result = runTrace(Impl.LIBRARY) {
+            select("live_a")
+            ready()
+            onBeforeStart = {
+                calls += 1
+                // Play intent is already up: a command that changes nothing.
+                fake.play()
+            }
+            error(2004, 404)
+        }
+        assertTrue(calls >= 1)
+        assertEquals(listOf("t=0 pause", "t=0 stop"), result.recoveryCommands())
+        val gaveUp = result.events.filterIsInstance<RecoveryEvent.GaveUp>().single()
+        assertEquals("live_a", gaveUp.mediaId)
+        assertTrue(gaveUp.permanent)
+        assertEquals(1, result.reports().size)
+        assertFalse(result.finalPlayWhenReady)
+    }
+
     @Test fun `a reselection inside the retry source call drops the failure it was asked for`() {
         val result = runTrace(Impl.LIBRARY) {
             select("live_a")

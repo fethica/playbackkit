@@ -72,6 +72,9 @@ internal class FakePlayer(
     override val currentPosition: Long
         get() = basePositionMs + (accrueFromMs?.let { clock() - it } ?: 0L)
 
+    /** The entry itself: `setMediaItems` makes a new one, a URI replace keeps it. */
+    override val currentItemToken: Any? get() = items.getOrNull(index)
+
     override fun mediaIdAt(index: Int): String? = items[index].id
     override fun uriAt(index: Int): String? = items[index].uri
 

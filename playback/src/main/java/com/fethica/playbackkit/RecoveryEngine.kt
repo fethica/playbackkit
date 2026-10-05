@@ -25,7 +25,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * host reacting to an event therefore never runs between a decision and its action. A
  * host call recovery cannot avoid making in the middle ([RecoveryHost.onBeforeAutomaticStart],
  * [RecoveryHost.retrySourceFor]) is followed by a fresh check of the current item and
- * play intent before recovery acts on what it read before the call.
+ * play intent before recovery acts on what it read before the call. At a failure's entry
+ * that check compares against the player as the failure found it, read before the first
+ * host call (see [EntryState]).
  */
 internal class RecoveryEngine(
     private val player: RecoveryPlayer,
@@ -210,7 +212,11 @@ internal class RecoveryEngine(
                 PLAYBACK_STATE_IDLE -> {
                     cancelBufferingRecovery()
                     cancelStallRecovery()
-                    if (RecoveryPolicy.shouldRecoverFromIdle(
+                    // Delivered behind a command a host issued from an earlier callback of the
+                    // same update (a fallback prepared from inside a failure's pre-start call),
+                    // this IDLE describes a player that has already left it.
+                    if (player.playbackState == PLAYBACK_STATE_IDLE &&
+                        RecoveryPolicy.shouldRecoverFromIdle(
                             playWhenReady = player.playWhenReady,
                             recoveryStopInProgress = recoveryStopInProgress,
                             errorReported = player.hasPlayerError,
@@ -282,6 +288,9 @@ internal class RecoveryEngine(
     // region Recovery
 
     private fun retryCurrentItem(reason: String, permanentFailure: Boolean = false) {
+        // The failure belongs to the item and intent current when it arrived, read before
+        // the host gets to issue commands.
+        val entry = EntryState()
         // A host stop is settled first, before anything below can count, report, re-arm
         // network waiting or schedule a rung, and an automatic start it vetoes is refused
         // at entry.
@@ -289,6 +298,13 @@ internal class RecoveryEngine(
         if (!host.automaticStartAllowed()) return
         if (detached.get()) return
         if (player.mediaItemCount <= 0) return
+        // The host chose, sought or paused inside that call: the failure is not about what
+        // plays now. Its callbacks may still be queued behind the one running, so the new
+        // intent is counted here; nothing is paused, stopped, counted or reported.
+        if (!entry.stillHolds()) {
+            generation += 1
+            return
+        }
 
         if (host.itemKind(player.currentMediaId) == ItemKind.FINITE) {
             if (RecoveryPolicy.finiteRecoveryAppliesTo(reason)) {
@@ -303,12 +319,10 @@ internal class RecoveryEngine(
         retryCount += 1
         if (RecoveryPolicy.countsAsPlaybackFailure(reason)) failureCount += 1
 
-        val mediaId = player.currentMediaId
-        val playWhenReady = player.playWhenReady
-        val intent = generation
+        val mediaId = entry.mediaId
         val retryUri = freshRetryUri(mediaId, player.currentUri, permanentFailure)
         // The host answered from inside recovery's work and may have issued commands.
-        if (!stillCurrent(mediaId, playWhenReady, intent)) return
+        if (!entry.stillHolds()) return
         val permanent = permanentFailure && retryUri == null
         val action = RecoveryPolicy.liveRecoveryActionFor(permanent, host.hasNetwork())
         val terminal = action == LiveRecoveryAction.STOP
@@ -383,6 +397,40 @@ internal class RecoveryEngine(
             }
         }
         emit(RecoveryEvent.RungScheduled(mediaId, generation, ItemKind.LIVE, reason, retryCount, delayMs, 0L))
+    }
+
+    /**
+     * The player as a failure found it, compared again after each host call made while
+     * handling that failure.
+     *
+     * A failure usually arrives inside a player callback. A command the host issues there
+     * only queues its own callbacks behind the one running, so [generation] has not moved
+     * yet when the call returns. The player's getters have: a reselection, even of the
+     * same id, gives the item a new [RecoveryPlayer.currentItemToken], a seek moves the
+     * position or the state, and a pause clears play intent. Position is compared only for
+     * a player that is not playing, where it cannot move on its own.
+     */
+    private inner class EntryState {
+        val mediaId: String? = player.currentMediaId
+        private val itemToken: Any? = player.currentItemToken
+        private val itemCount = player.mediaItemCount
+        private val index = player.currentMediaItemIndex
+        private val playWhenReady = player.playWhenReady
+        private val playbackState = player.playbackState
+        private val hasError = player.hasPlayerError
+        private val playing = player.isPlaying
+        private val positionMs = player.currentPosition
+        private val intent = generation
+
+        fun stillHolds(): Boolean =
+            stillCurrent(mediaId, playWhenReady, intent) &&
+                player.currentItemToken === itemToken &&
+                player.mediaItemCount == itemCount &&
+                player.currentMediaItemIndex == index &&
+                player.playbackState == playbackState &&
+                player.hasPlayerError == hasError &&
+                player.isPlaying == playing &&
+                (playing || player.currentPosition == positionMs)
     }
 
     /**

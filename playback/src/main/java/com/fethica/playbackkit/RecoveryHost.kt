@@ -62,7 +62,10 @@ public interface RecoveryHost {
      * A host with a sleep timer settles a timer that is already past its deadline here. It
      * may pause or stop the player and call [PlaybackRecovery.cancelAutomaticWork] from
      * inside this call. Recovery reads the player again after it returns: a rung whose
-     * item was chosen again, sought, paused or vetoed in the meantime does not run.
+     * item was chosen again, sought, paused or vetoed in the meantime does not run. At a
+     * failure's entry the player is read before this call too; a failure whose item was
+     * chosen again (even with the same id), sought or paused here is dropped: recovery
+     * pauses, stops, counts and reports nothing for it, and the new item is left alone.
      */
     public fun onBeforeAutomaticStart() {}
 
