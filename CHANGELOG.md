@@ -8,3 +8,4 @@
 - Added `RecoveryConfig`; every default is the timing the rules are tested against.
 - Added the pure `RecoveryPolicy` rules and the transport rules (`playPauseActionFor`, `isEffectivelyPlaying`), with JVM tests.
 - Added differential trace tests that run each scenario against a reference implementation and the library on a fake player and virtual clock, and require identical logs.
+- Added a sample app: a host-owned media session service with recovery attached, generated finite and live-like fixtures on a loopback server, and a debug panel with a switch for each recovery scenario.

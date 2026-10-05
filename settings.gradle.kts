@@ -23,3 +23,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "playback-kit"
 include(":playback")
+// The sample app: never published, never a dependency of the library.
+include(":sample")
