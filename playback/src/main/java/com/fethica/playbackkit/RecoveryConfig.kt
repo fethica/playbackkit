@@ -12,7 +12,10 @@ package com.fethica.playbackkit
  *   progress.
  * @param stallTimeoutMs how long the position may stand still, while READY and playing,
  *   before it counts as a failure.
- * @param stablePlaybackMs how long playback must run before the ladder is cleared.
+ * @param stablePlaybackMs the stable-playback window. Every READY starts it on the wall
+ *   clock and the next failure cancels it; when it ends the ladder is cleared if the
+ *   player is playing at that moment. Paused time inside the window counts; only the
+ *   end is checked.
  * @param baseDelayMs the first rung of the backoff.
  * @param maxDelayMs the ceiling the backoff doubles towards.
  * @param failureReportThreshold how many live failures, since the last real item
@@ -21,7 +24,8 @@ package com.fethica.playbackkit
  * @param maxFiniteRecoveryAttempts how many times a finite item is re-prepared at its
  *   retained position before it is given up on.
  * @param suppressionPollMs how often a held-back rung checks whether playback suppression
- *   has lifted.
+ *   has lifted. Suppression holds watchdog detection and rung execution only: a player
+ *   error or a network arrival during it still counts and schedules the next rung.
  */
 public data class RecoveryConfig(
     val bufferingTimeoutMs: Long = 15_000L,

@@ -11,14 +11,14 @@ Nothing is published yet. Build it from source.
 - **Live items**: re-prepares from the live edge on a backoff that starts at one second and doubles to a 30 second ceiling. A permanent failure (a 404, an unsupported format) stops the player instead of spinning, and is reported at once.
 - **Finite items**: re-prepares at the retained position, up to three attempts. Slow buffering and the end of the item never spend that budget.
 - **Watchdogs**: a buffering timeout for live items and a stall check for a position that stops moving while READY.
-- **Suppression**: a call or a navigation prompt never counts as a stall and never spends a retry. A due retry waits until the suppression lifts.
+- **Suppression**: while a call or a navigation prompt suppresses playback, the buffering and stall watchdogs record no failure, and a rung that comes due waits until the suppression lifts. A player error or a network arrival during the suppression still enters recovery: it counts and schedules the next rung as usual, and that rung then waits.
 - **Pauses**: a pause the listener asked for, a headset unplug, a remote pause or a permanent focus loss ends recovery. A delayed retry re-checks play intent before it runs.
-- **Network**: offline failures wait for a network arrival instead of retrying blind. Arrivals can be signalled from any thread.
-- **Stable playback**: the ladder resets only after playback has run for 30 seconds, never on a READY blip.
+- **Network**: offline failures wait for a network arrival instead of retrying blind. An arrival schedules the next rung of the ladder (for a live item deep in the ladder that can be up to 30 seconds away), it does not re-prepare on the spot. Arrivals can be signalled from any thread.
+- **Stable playback**: the ladder never resets on a READY blip. Every READY starts a 30 second wall-clock window, cancelled by a failure, a seek or a new item; when it ends, the ladder resets if the player is playing at that moment. Time spent paused inside the window counts.
 
 ## Usage
 
-Attach on the player's application looper, after the player is built:
+Attach on the player's application looper, after the player is built. The player may already hold a prepared item: `attach` reads its current item and state and arms the matching watchdog, without treating the attachment as a new selection:
 
 ```kotlin
 val recovery = PlaybackRecovery.attach(
@@ -57,7 +57,7 @@ player.release()
 - **`hasNetwork`**: the fail-open predicate. Answer from the INTERNET capability, not validation, and answer true when you cannot ask.
 - **`automaticStartAllowed`** and **`onBeforeAutomaticStart`**: a veto for when your app stopped playback on purpose, a sleep timer for example.
 - **`retrySourceFor`**: a different URI to retry a live item on, when your catalog has moved it.
-- **`onEvent`**: everything recovery did, as a `RecoveryEvent`.
+- **`onEvent`**: everything recovery did, as a `RecoveryEvent`, delivered after the work that raised it is complete. It is for observing. To answer an event with player commands (play a fallback, seek), post them to a later turn of the looper, so the commands' own callbacks are not delivered in the middle of the ones still in flight.
 
 ### Events and reporting
 

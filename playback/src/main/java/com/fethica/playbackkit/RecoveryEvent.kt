@@ -106,7 +106,10 @@ public enum class LadderResetCause {
     /** A real item transition: a different item, or the same item chosen again. */
     ITEM_CHANGED,
 
-    /** Playback ran for the stable window. Report state is deliberately kept. */
+    /**
+     * The stable-playback window started at READY ended with the player playing. Paused
+     * time inside the window counts. Report state is deliberately kept.
+     */
     STABLE_PLAYBACK,
 
     /** A seek the ladder did not make re-armed the finite attempt budget. */

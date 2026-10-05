@@ -44,7 +44,8 @@ public object RecoveryPolicy {
     public const val MAX_DELAY_MS: Long = 30_000L
 
     /**
-     * How long playback must actually run before an item counts as recovered.
+     * The stable-playback window: how long after READY, on the wall clock, the ladder is
+     * cleared if the player is playing when it ends. Paused time inside it counts.
      *
      * Not "reached READY": a flapping stream reaches READY for an instant on every cycle,
      * so resetting there restarts the ladder forever and it never escalates.
@@ -72,7 +73,10 @@ public object RecoveryPolicy {
         return baseDelayMs shl doublings
     }
 
-    /** True only after [stablePlaybackMs] of real playback, never on a READY blip. */
+    /**
+     * True once [playedMs], the wall-clock time since READY, reaches [stablePlaybackMs]. The
+     * caller checks that the player is playing at that moment; nothing checks in between.
+     */
     public fun shouldResetLadder(playedMs: Long, stablePlaybackMs: Long = STABLE_PLAYBACK_MS): Boolean =
         playedMs >= stablePlaybackMs
 
@@ -128,8 +132,9 @@ public object RecoveryPolicy {
      * What a failed live item should do.
      *
      * [shouldScheduleRetry] answers "no retry" for two opposite situations. Offline is
-     * waited out with play intent left up, because the network arrival re-prepares as
-     * soon as signal returns. A permanent failure has nothing coming, so it stops:
+     * waited out with play intent left up, because the network arrival schedules the next
+     * rung of the ladder, which re-prepares after that rung's delay. A permanent failure
+     * has nothing coming, so it stops:
      * otherwise a live item whose URL answers 404 spins forever and never reaches the
      * failure threshold.
      *
