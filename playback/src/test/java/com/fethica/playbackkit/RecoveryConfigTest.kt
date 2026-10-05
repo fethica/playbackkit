@@ -1,0 +1,40 @@
+package com.fethica.playbackkit
+
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class RecoveryConfigTest {
+
+    @Test fun `the defaults are the tested timings`() {
+        val config = RecoveryConfig()
+        assertEquals(15_000L, config.bufferingTimeoutMs)
+        assertEquals(5_000L, config.stallCheckIntervalMs)
+        assertEquals(250L, config.stallToleranceMs)
+        assertEquals(15_000L, config.stallTimeoutMs)
+        assertEquals(30_000L, config.stablePlaybackMs)
+        assertEquals(1_000L, config.baseDelayMs)
+        assertEquals(30_000L, config.maxDelayMs)
+        assertEquals(6, config.failureReportThreshold)
+        assertEquals(3, config.maxFiniteRecoveryAttempts)
+        assertEquals(1_000L, config.suppressionPollMs)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `a ceiling below the first rung is rejected`() {
+        RecoveryConfig(baseDelayMs = 2_000L, maxDelayMs = 1_000L)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `a zero threshold is rejected`() {
+        RecoveryConfig(failureReportThreshold = 0)
+    }
+
+    @Test fun `a custom backoff doubles to its own ceiling without overflow`() {
+        assertEquals(500L, RecoveryPolicy.retryDelayMs(1, baseDelayMs = 500L, maxDelayMs = 4_000L))
+        assertEquals(1_000L, RecoveryPolicy.retryDelayMs(2, baseDelayMs = 500L, maxDelayMs = 4_000L))
+        assertEquals(4_000L, RecoveryPolicy.retryDelayMs(4, baseDelayMs = 500L, maxDelayMs = 4_000L))
+        assertEquals(4_000L, RecoveryPolicy.retryDelayMs(9, baseDelayMs = 500L, maxDelayMs = 4_000L))
+        assertEquals(3L shl 29, RecoveryPolicy.retryDelayMs(30, baseDelayMs = 3L, maxDelayMs = Long.MAX_VALUE))
+        assertEquals(Long.MAX_VALUE, RecoveryPolicy.retryDelayMs(40, baseDelayMs = 3L, maxDelayMs = Long.MAX_VALUE))
+    }
+}
