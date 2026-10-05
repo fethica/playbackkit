@@ -15,13 +15,18 @@ import kotlinx.coroutines.android.asCoroutineDispatcher
 /**
  * Playback recovery for one Media3 [Player]: a retry ladder for live items, a bounded
  * recovery at the retained position for finite items, buffering and stall watchdogs that
- * stand down while playback is only suppressed, a network-arrival handoff, and a ladder
- * that only resets after playback has genuinely held up.
+ * do not record failures while playback is only suppressed, a network-arrival handoff,
+ * and a ladder that never resets on a READY blip: it resets when a wall-clock window
+ * started at READY ends with the player playing (see [RecoveryConfig.stablePlaybackMs]).
  *
  * ## Lifecycle
  *
  * One owner. Create it with [attach] on the player's application looper, after the
- * player is built, and call [detach] before the player is released. [detach] cancels
+ * player is built, and call [detach] before the player is released. The player may
+ * already hold a prepared item: [attach] takes its current item as the baseline (not as a
+ * new selection, so nothing is reset or reported) and arms the watchdog its current state
+ * calls for, the stall check when READY with play requested and the buffering timeout
+ * when BUFFERING. [detach] cancels
  * every rung, watchdog and pending network handoff and is idempotent; anything that
  * arrives afterwards is dropped. Attach to the player that actually plays (the one whose
  * errors and states recovery must see), not to a wrapper that hides them.
@@ -178,6 +183,8 @@ public class PlaybackRecovery private constructor(
             )
             val recovery = PlaybackRecovery(player, engine, registerListener)
             if (registerListener) player.addListener(recovery.listener)
+            // Registering a listener replays nothing: read what the player already holds.
+            engine.onAttached()
             return recovery
         }
     }

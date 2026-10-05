@@ -23,8 +23,17 @@ public enum class ItemKind {
  * the questions it cannot answer and reports back through [onEvent].
  *
  * Every method is called on the player's application looper, synchronously from inside
- * recovery's own work. A method may call player commands, but must not detach the
- * recovery from inside a call.
+ * recovery's own work, and none may detach the recovery from inside a call.
+ *
+ * Only [onBeforeAutomaticStart] is meant to issue player commands. [itemKind],
+ * [hasNetwork], [automaticStartAllowed] and [retrySourceFor] are queries. [onEvent] is
+ * observational: it runs after the work that raised the event is complete, so it never
+ * interrupts a decision, but a host that wants to answer an event with player commands
+ * (play a fallback item, seek, reselect) should post them to a later turn of the looper.
+ * A command issued from inside a player callback has its own callbacks queued behind the
+ * one still being delivered, so recovery and every other listener would first hear the
+ * rest of the old callbacks, describing the player as it was, while the player already
+ * holds the new state. Posting keeps each side's callbacks in their own turn.
  */
 public interface RecoveryHost {
 
@@ -52,7 +61,8 @@ public interface RecoveryHost {
      *
      * A host with a sleep timer settles a timer that is already past its deadline here. It
      * may pause or stop the player and call [PlaybackRecovery.cancelAutomaticWork] from
-     * inside this call.
+     * inside this call. Recovery reads the player again after it returns: a rung whose
+     * item was chosen again, sought, paused or vetoed in the meantime does not run.
      */
     public fun onBeforeAutomaticStart() {}
 
@@ -75,9 +85,17 @@ public interface RecoveryHost {
      * permanent failure into a retry, and the rung swaps the URI in place with the media id
      * kept, inside the same-id bracket, so the ladder does not read the swap as a new
      * selection. Never asked for finite items.
+     *
+     * A query. Should it issue player commands anyway, recovery reads the current item and
+     * play intent again after the call and drops the failure or rung when they changed.
      */
     public fun retrySourceFor(mediaId: String?, currentUri: String?, permanent: Boolean): String? = null
 
-    /** A recovery event, delivered synchronously on the player's looper. */
+    /**
+     * A recovery event, delivered on the player's looper once the transaction that raised
+     * it has finished: the commands it decided on are issued and the rung it announces is
+     * installed and cancellable. Events from one transaction arrive in the order they were
+     * raised. Observational; see the interface documentation for issuing commands.
+     */
     public fun onEvent(event: RecoveryEvent) {}
 }

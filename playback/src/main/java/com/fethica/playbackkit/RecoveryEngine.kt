@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -14,6 +15,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * and stall watchdogs, suppression-aware waiting, the network-arrival handoff and the
  * stable-playback reset. Every member except [onNetworkArrival] runs on the player's
  * looper; [scope] dispatches on that looper too.
+ *
+ * ## Events are delivered after the work that caused them
+ *
+ * Every entry point (a player callback, a delayed job, attachment) runs as one
+ * transaction. [RecoveryEvent]s raised inside it are queued and handed to
+ * [RecoveryHost.onEvent] only once the transaction has finished: the player commands it
+ * decided on have been issued and the rung it scheduled is installed and cancellable. A
+ * host reacting to an event therefore never runs between a decision and its action. A
+ * host call recovery cannot avoid making in the middle ([RecoveryHost.onBeforeAutomaticStart],
+ * [RecoveryHost.retrySourceFor]) is followed by a fresh check of the current item and
+ * play intent before recovery acts on what it read before the call.
  */
 internal class RecoveryEngine(
     private val player: RecoveryPlayer,
@@ -71,6 +83,11 @@ internal class RecoveryEngine(
     private var lastObservedPositionMs = 0L
     private var lastPositionRealtimeMs = 0L
 
+    /** Events raised by the running transaction, delivered when it finishes. */
+    private val pendingEvents = ArrayDeque<RecoveryEvent>()
+    private var transactionDepth = 0
+    private var deliveringEvents = false
+
     /** Playback-intent generation; informational, see [RecoveryEvent]. */
     var generation: Long = 0L
         private set
@@ -85,8 +102,10 @@ internal class RecoveryEngine(
         scope.launch {
             if (detached.get()) return@launch
             if (!awaitingNetwork.getAndSet(false)) return@launch
-            if (player.playWhenReady && player.mediaItemCount > 0) {
-                retryCurrentItem(RecoveryPolicy.REASON_NETWORK_RESTORED)
+            transaction<Unit> {
+                if (player.playWhenReady && player.mediaItemCount > 0) {
+                    retryCurrentItem(RecoveryPolicy.REASON_NETWORK_RESTORED)
+                }
             }
         }
     }
@@ -110,6 +129,21 @@ internal class RecoveryEngine(
         generation += 1
     }
 
+    /**
+     * Takes over a player that may already hold a prepared item: records its current item
+     * as the baseline a seek or an in-place replace is judged against, and arms the
+     * watchdog its state calls for. Not a selection: nothing is reset, cancelled or
+     * reported.
+     */
+    fun onAttached() {
+        if (detached.get()) return
+        lastTransitionMediaId = player.currentMediaId
+        when (player.playbackState) {
+            STATE_READY -> if (player.playWhenReady) startStallRecovery()
+            STATE_BUFFERING -> scheduleBufferingRecovery()
+        }
+    }
+
     fun detach() {
         if (!detached.compareAndSet(false, true)) return
         retryJob = null
@@ -126,108 +160,120 @@ internal class RecoveryEngine(
     // region Player callbacks
 
     override fun onMediaItemTransition(mediaId: String?, reason: Int) {
-        if (detached.get()) return
-        if (RecoveryPolicy.shouldSuppressTransition(hostReplaceInProgress, reason, lastTransitionMediaId, mediaId)) {
-            return
+        transaction<Unit> {
+            if (detached.get()) return
+            if (RecoveryPolicy.shouldSuppressTransition(hostReplaceInProgress, reason, lastTransitionMediaId, mediaId)) {
+                return
+            }
+            lastTransitionMediaId = mediaId
+            // A real selection is a legitimate fresh start, unlike a READY blip.
+            cancelRetry()
+            cancelLadderReset()
+            awaitingNetwork.set(false)
+            retryCount = 0
+            failureCount = 0
+            failureIncidentOpen = false
+            finiteRecoveryAttempts = 0
+            // A real transition is never the ladder's own seek.
+            ladderInitiatedSeek = false
+            generation += 1
+            emit(RecoveryEvent.LadderReset(mediaId, generation, LadderResetCause.ITEM_CHANGED))
         }
-        lastTransitionMediaId = mediaId
-        // A real selection is a legitimate fresh start, unlike a READY blip.
-        cancelRetry()
-        cancelLadderReset()
-        awaitingNetwork.set(false)
-        retryCount = 0
-        failureCount = 0
-        failureIncidentOpen = false
-        finiteRecoveryAttempts = 0
-        // A real transition is never the ladder's own seek.
-        ladderInitiatedSeek = false
-        generation += 1
-        emit(RecoveryEvent.LadderReset(mediaId, generation, LadderResetCause.ITEM_CHANGED))
     }
 
     override fun onPlayerError(errorCode: Int, errorCodeName: String, httpStatus: Int?) {
-        if (detached.get()) return
-        val reason = if (httpStatus != null) "$errorCodeName:$httpStatus" else errorCodeName
-        retryCurrentItem(reason, permanentFailure = RecoveryPolicy.isPermanentFailure(errorCode, httpStatus))
+        transaction<Unit> {
+            if (detached.get()) return
+            val reason = if (httpStatus != null) "$errorCodeName:$httpStatus" else errorCodeName
+            retryCurrentItem(reason, permanentFailure = RecoveryPolicy.isPermanentFailure(errorCode, httpStatus))
+        }
     }
 
     override fun onPlaybackStateChanged(playbackState: Int) {
-        if (detached.get()) return
-        when (playbackState) {
-            STATE_READY -> {
-                // Deliberately does not reset the ladder: a flapping stream reaches READY
-                // for an instant on every cycle. Stable playback resets it instead.
-                cancelBufferingRecovery()
-                startStallRecovery()
-                scheduleLadderReset()
-            }
-            STATE_BUFFERING -> scheduleBufferingRecovery()
-            PLAYBACK_STATE_ENDED -> {
-                cancelStallRecovery()
-                // The end of a finite item is not a failure; only a live item reaching
-                // ENDED is, and the policy routes the reason accordingly.
-                retryCurrentItem(RecoveryPolicy.REASON_STATE_ENDED)
-            }
-            PLAYBACK_STATE_IDLE -> {
-                cancelBufferingRecovery()
-                cancelStallRecovery()
-                if (RecoveryPolicy.shouldRecoverFromIdle(
-                        playWhenReady = player.playWhenReady,
-                        recoveryStopInProgress = recoveryStopInProgress,
-                        errorReported = player.hasPlayerError,
-                    )
-                ) {
-                    retryCurrentItem(RecoveryPolicy.REASON_STATE_IDLE)
+        transaction<Unit> {
+            if (detached.get()) return
+            when (playbackState) {
+                STATE_READY -> {
+                    // Deliberately does not reset the ladder: a flapping stream reaches READY
+                    // for an instant on every cycle. Stable playback resets it instead.
+                    cancelBufferingRecovery()
+                    startStallRecovery()
+                    scheduleLadderReset()
+                }
+                STATE_BUFFERING -> scheduleBufferingRecovery()
+                PLAYBACK_STATE_ENDED -> {
+                    cancelStallRecovery()
+                    // The end of a finite item is not a failure; only a live item reaching
+                    // ENDED is, and the policy routes the reason accordingly.
+                    retryCurrentItem(RecoveryPolicy.REASON_STATE_ENDED)
+                }
+                PLAYBACK_STATE_IDLE -> {
+                    cancelBufferingRecovery()
+                    cancelStallRecovery()
+                    if (RecoveryPolicy.shouldRecoverFromIdle(
+                            playWhenReady = player.playWhenReady,
+                            recoveryStopInProgress = recoveryStopInProgress,
+                            errorReported = player.hasPlayerError,
+                        )
+                    ) {
+                        retryCurrentItem(RecoveryPolicy.REASON_STATE_IDLE)
+                    }
                 }
             }
         }
     }
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
-        if (detached.get()) return
-        if (!isPlaying &&
-            player.playWhenReady &&
-            player.playbackState == STATE_READY &&
-            player.playbackSuppressionReason == RecoveryPolicy.PLAYBACK_SUPPRESSION_REASON_NONE
-        ) {
-            retryCurrentItem(RecoveryPolicy.REASON_READY_NOT_PLAYING)
-            return
-        }
-        // The host's veto also keeps the stall watchdog from coming back while a host stop
-        // (a sleep timer's pause, for example) is still on the stack.
-        if (!isPlaying && host.automaticStartAllowed()) {
-            startStallRecovery()
+        transaction<Unit> {
+            if (detached.get()) return
+            if (!isPlaying &&
+                player.playWhenReady &&
+                player.playbackState == STATE_READY &&
+                player.playbackSuppressionReason == RecoveryPolicy.PLAYBACK_SUPPRESSION_REASON_NONE
+            ) {
+                retryCurrentItem(RecoveryPolicy.REASON_READY_NOT_PLAYING)
+                return
+            }
+            // The host's veto also keeps the stall watchdog from coming back while a host stop
+            // (a sleep timer's pause, for example) is still on the stack.
+            if (!isPlaying && host.automaticStartAllowed()) {
+                startStallRecovery()
+            }
         }
     }
 
     override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-        if (detached.get()) return
-        if (playWhenReady) generation += 1
-        if (playWhenReady) startStallRecovery() else cancelStallRecovery()
-        val endsRecovery = RecoveryPolicy.shouldCancelRecoveryOnPlayWhenReady(playWhenReady, reason)
-        if (endsRecovery) generation += 1
-        if (endsRecovery && retryJob?.isActive == true) {
-            // The pending rung would end in play() and resume what the listener paused.
-            cancelRetry()
+        transaction<Unit> {
+            if (detached.get()) return
+            if (playWhenReady) generation += 1
+            if (playWhenReady) startStallRecovery() else cancelStallRecovery()
+            val endsRecovery = RecoveryPolicy.shouldCancelRecoveryOnPlayWhenReady(playWhenReady, reason)
+            if (endsRecovery) generation += 1
+            if (endsRecovery && retryJob?.isActive == true) {
+                // The pending rung would end in play() and resume what the listener paused.
+                cancelRetry()
+            }
         }
     }
 
     override fun onPositionDiscontinuity(reason: Int) {
-        if (detached.get()) return
-        if (reason != DISCONTINUITY_REASON_SEEK) return
-        val mediaId = player.currentMediaId ?: return
-        if (host.itemKind(mediaId) != ItemKind.FINITE) return
-        // A seek reported around a playlist change belongs to the item that is arriving.
-        if (mediaId != lastTransitionMediaId) return
-        // A pending rung was scheduled against the pre-seek position.
-        cancelRetry()
-        cancelLadderReset()
-        // Report state and awaitingNetwork survive a seek. The attempt budget re-arms, but
-        // only for a seek the ladder did not make: every finite rung ends in its own seek.
-        if (RecoveryPolicy.shouldResetFiniteLadderOnSeek(ladderInitiatedSeek)) {
-            finiteRecoveryAttempts = 0
-            generation += 1
-            emit(RecoveryEvent.LadderReset(mediaId, generation, LadderResetCause.USER_SEEK))
+        transaction<Unit> {
+            if (detached.get()) return
+            if (reason != DISCONTINUITY_REASON_SEEK) return
+            val mediaId = player.currentMediaId ?: return
+            if (host.itemKind(mediaId) != ItemKind.FINITE) return
+            // A seek reported around a playlist change belongs to the item that is arriving.
+            if (mediaId != lastTransitionMediaId) return
+            // A pending rung was scheduled against the pre-seek position.
+            cancelRetry()
+            cancelLadderReset()
+            // Report state and awaitingNetwork survive a seek. The attempt budget re-arms, but
+            // only for a seek the ladder did not make: every finite rung ends in its own seek.
+            if (RecoveryPolicy.shouldResetFiniteLadderOnSeek(ladderInitiatedSeek)) {
+                finiteRecoveryAttempts = 0
+                generation += 1
+                emit(RecoveryEvent.LadderReset(mediaId, generation, LadderResetCause.USER_SEEK))
+            }
         }
     }
 
@@ -258,7 +304,11 @@ internal class RecoveryEngine(
         if (RecoveryPolicy.countsAsPlaybackFailure(reason)) failureCount += 1
 
         val mediaId = player.currentMediaId
+        val playWhenReady = player.playWhenReady
+        val intent = generation
         val retryUri = freshRetryUri(mediaId, player.currentUri, permanentFailure)
+        // The host answered from inside recovery's work and may have issued commands.
+        if (!stillCurrent(mediaId, playWhenReady, intent)) return
         val permanent = permanentFailure && retryUri == null
         val action = RecoveryPolicy.liveRecoveryActionFor(permanent, host.hasNetwork())
         val terminal = action == LiveRecoveryAction.STOP
@@ -303,29 +353,50 @@ internal class RecoveryEngine(
         // A rung is only ever valid for the item it was scheduled for.
         val scheduledMediaId = mediaId
         cancelRetry()
-        emit(RecoveryEvent.RungScheduled(mediaId, generation, ItemKind.LIVE, reason, retryCount, delayMs, 0L))
+        // Installed before it is announced, so a host reacting to the event can cancel it.
         retryJob = scope.launch {
             delay(delayMs)
             awaitPlaybackUnsuppressed()
-            host.onBeforeAutomaticStart()
-            if (!host.automaticStartAllowed()) return@launch
-            if (player.mediaItemCount <= 0) return@launch
-            if (player.currentMediaId != scheduledMediaId) return@launch
-            // The rung ends in play(); a pause since it was scheduled makes it stale.
-            if (!RecoveryPolicy.shouldRunPendingRecovery(player.playWhenReady)) return@launch
-            val index = player.currentMediaItemIndex.coerceIn(0, player.mediaItemCount - 1)
-            recoveryStopInProgress = true
-            try {
-                player.stop()
-            } finally {
-                recoveryStopInProgress = false
+            transaction<Unit> {
+                host.onBeforeAutomaticStart()
+                // A reselection or a seek made inside that call has already cancelled this rung.
+                if (!isActive) return@launch
+                if (!host.automaticStartAllowed()) return@launch
+                if (player.mediaItemCount <= 0) return@launch
+                if (player.currentMediaId != scheduledMediaId) return@launch
+                // The rung ends in play(); a pause since it was scheduled makes it stale.
+                if (!RecoveryPolicy.shouldRunPendingRecovery(player.playWhenReady)) return@launch
+                val index = player.currentMediaItemIndex.coerceIn(0, player.mediaItemCount - 1)
+                recoveryStopInProgress = true
+                try {
+                    player.stop()
+                } finally {
+                    recoveryStopInProgress = false
+                }
+                // Asked again here because the answer can change during the backoff.
+                val retryUri = freshRetryUri(player.mediaIdAt(index), player.uriAt(index), permanent = false)
+                if (!isActive || !stillCurrent(scheduledMediaId, playWhenReady = true, intent = null)) return@launch
+                if (retryUri != null) swapToRetrySource(index, retryUri)
+                player.seekTo(index, 0)
+                player.prepare()
+                player.play()
             }
-            swapToRetrySource(index)
-            player.seekTo(index, 0)
-            player.prepare()
-            player.play()
         }
+        emit(RecoveryEvent.RungScheduled(mediaId, generation, ItemKind.LIVE, reason, retryCount, delayMs, 0L))
     }
+
+    /**
+     * Whether the item and play intent recovery read before a host call are still the
+     * current ones. [intent] is the generation read before the call, or null to skip that
+     * check; the generation alone is not enough, since a callback the call caused may
+     * still be queued behind the one running now.
+     */
+    private fun stillCurrent(mediaId: String?, playWhenReady: Boolean, intent: Long?): Boolean =
+        !detached.get() &&
+            player.mediaItemCount > 0 &&
+            player.currentMediaId == mediaId &&
+            player.playWhenReady == playWhenReady &&
+            (intent == null || generation == intent)
 
     /** The host's replacement URI, kept only when it really is a different one. */
     private fun freshRetryUri(mediaId: String?, currentUri: String?, permanent: Boolean): String? {
@@ -335,11 +406,9 @@ internal class RecoveryEngine(
 
     /**
      * Points the failing item at the host's replacement URI right before a rung
-     * re-prepares it. Asked again here because the answer can change during the backoff.
-     * The swap keeps the media id, so it runs inside the same-id bracket.
+     * re-prepares it. The swap keeps the media id, so it runs inside the same-id bracket.
      */
-    private fun swapToRetrySource(index: Int) {
-        val retryUri = freshRetryUri(player.mediaIdAt(index), player.uriAt(index), permanent = false) ?: return
+    private fun swapToRetrySource(index: Int, retryUri: String) {
         runHostReplace { player.replaceUri(index, retryUri) }
     }
 
@@ -374,35 +443,40 @@ internal class RecoveryEngine(
                 val scheduledMediaId = mediaId
                 val delayMs = RecoveryPolicy.retryDelayMs(attempt, config.baseDelayMs, config.maxDelayMs)
                 cancelRetry()
+                // Installed before it is announced, so a host reacting to the event can cancel it.
+                retryJob = scope.launch {
+                    delay(delayMs)
+                    awaitPlaybackUnsuppressed()
+                    transaction<Unit> {
+                        host.onBeforeAutomaticStart()
+                        // A reselection or a seek made inside that call has already cancelled this rung.
+                        if (!isActive) return@launch
+                        if (!host.automaticStartAllowed()) return@launch
+                        if (player.mediaItemCount <= 0) return@launch
+                        if (player.currentMediaId != scheduledMediaId) return@launch
+                        if (!RecoveryPolicy.shouldRunPendingRecovery(player.playWhenReady)) return@launch
+                        recoveryStopInProgress = true
+                        try {
+                            player.stop()
+                        } finally {
+                            recoveryStopInProgress = false
+                        }
+                        ladderInitiatedSeek = true
+                        try {
+                            player.seekTo(index, retainedPositionMs)
+                            player.prepare()
+                            player.play()
+                        } finally {
+                            ladderInitiatedSeek = false
+                        }
+                        emit(RecoveryEvent.FiniteRecovered(scheduledMediaId, generation, attempt, retainedPositionMs))
+                    }
+                }
                 emit(
                     RecoveryEvent.RungScheduled(
                         mediaId, generation, ItemKind.FINITE, reason, attempt, delayMs, retainedPositionMs,
                     ),
                 )
-                retryJob = scope.launch {
-                    delay(delayMs)
-                    awaitPlaybackUnsuppressed()
-                    host.onBeforeAutomaticStart()
-                    if (!host.automaticStartAllowed()) return@launch
-                    if (player.mediaItemCount <= 0) return@launch
-                    if (player.currentMediaId != scheduledMediaId) return@launch
-                    if (!RecoveryPolicy.shouldRunPendingRecovery(player.playWhenReady)) return@launch
-                    recoveryStopInProgress = true
-                    try {
-                        player.stop()
-                    } finally {
-                        recoveryStopInProgress = false
-                    }
-                    ladderInitiatedSeek = true
-                    try {
-                        player.seekTo(index, retainedPositionMs)
-                        player.prepare()
-                        player.play()
-                    } finally {
-                        ladderInitiatedSeek = false
-                    }
-                    emit(RecoveryEvent.FiniteRecovered(scheduledMediaId, generation, attempt, retainedPositionMs))
-                }
             }
         }
     }
@@ -421,7 +495,7 @@ internal class RecoveryEngine(
         var announced = false
         while (RecoveryPolicy.shouldDeferRecovery(player.playbackSuppressionReason)) {
             if (!announced) {
-                emit(RecoveryEvent.WaitingForSuppression(player.currentMediaId, generation))
+                transaction<Unit> { emit(RecoveryEvent.WaitingForSuppression(player.currentMediaId, generation)) }
                 announced = true
             }
             delay(config.suppressionPollMs)
@@ -429,9 +503,9 @@ internal class RecoveryEngine(
     }
 
     /**
-     * Clears the ladder only after playback has genuinely held up. Scheduled on every
-     * READY, cancelled by the next failure, so a stream that blips READY and drops again
-     * never gets its ladder back.
+     * Clears the ladder when a wall-clock window started at READY ends with the player
+     * playing. Scheduled on every READY, cancelled by the next failure, so a stream that
+     * blips READY and drops again never gets its ladder back. Only the end is checked.
      */
     private fun scheduleLadderReset() {
         if (retryCount == 0 && !failureIncidentOpen && finiteRecoveryAttempts == 0) return
@@ -440,13 +514,15 @@ internal class RecoveryEngine(
             val startedAtMs = clock()
             delay(config.stablePlaybackMs)
             val playedMs = clock() - startedAtMs
-            if (player.isPlaying && RecoveryPolicy.shouldResetLadder(playedMs, config.stablePlaybackMs)) {
-                retryCount = 0
-                failureCount = 0
-                // The incident stays open: report state survives a stable stretch and is
-                // cleared by the next real transition, which is what makes it per incident.
-                finiteRecoveryAttempts = 0
-                emit(RecoveryEvent.LadderReset(player.currentMediaId, generation, LadderResetCause.STABLE_PLAYBACK))
+            transaction<Unit> {
+                if (player.isPlaying && RecoveryPolicy.shouldResetLadder(playedMs, config.stablePlaybackMs)) {
+                    retryCount = 0
+                    failureCount = 0
+                    // The incident stays open: report state survives a stable stretch and is
+                    // cleared by the next real transition, which is what makes it per incident.
+                    finiteRecoveryAttempts = 0
+                    emit(RecoveryEvent.LadderReset(player.currentMediaId, generation, LadderResetCause.STABLE_PLAYBACK))
+                }
             }
         }
     }
@@ -466,7 +542,7 @@ internal class RecoveryEngine(
                 return@launch
             }
             if (player.playbackState == STATE_BUFFERING && player.playWhenReady) {
-                retryCurrentItem(RecoveryPolicy.REASON_BUFFER_TIMEOUT)
+                transaction<Unit> { retryCurrentItem(RecoveryPolicy.REASON_BUFFER_TIMEOUT) }
             }
         }
     }
@@ -498,7 +574,7 @@ internal class RecoveryEngine(
                 return@launch
             }
             if (now - lastPositionRealtimeMs >= config.stallTimeoutMs) {
-                retryCurrentItem(RecoveryPolicy.REASON_STALL_READY)
+                transaction<Unit> { retryCurrentItem(RecoveryPolicy.REASON_STALL_READY) }
                 return@launch
             }
             scheduleStallCheck()
@@ -515,8 +591,39 @@ internal class RecoveryEngine(
         stallRecoveryJob = null
     }
 
+    /** Queues [event] for delivery when the running transaction finishes. */
     private fun emit(event: RecoveryEvent) {
-        host.onEvent(event)
+        pendingEvents.addLast(event)
+        if (transactionDepth == 0) deliverEvents()
+    }
+
+    /**
+     * Runs [block] as one transaction: events it raises are delivered only after it, and
+     * every transaction nested inside it, has finished.
+     */
+    private inline fun <T> transaction(block: () -> T): T {
+        transactionDepth += 1
+        try {
+            return block()
+        } finally {
+            transactionDepth -= 1
+            if (transactionDepth == 0) deliverEvents()
+        }
+    }
+
+    /**
+     * Hands queued events to the host in order. A host command that re-enters recovery
+     * during delivery runs its own transaction; its events join the end of the queue
+     * instead of overtaking the ones still waiting.
+     */
+    private fun deliverEvents() {
+        if (deliveringEvents) return
+        deliveringEvents = true
+        try {
+            while (pendingEvents.isNotEmpty()) host.onEvent(pendingEvents.removeFirst())
+        } finally {
+            deliveringEvents = false
+        }
     }
 
     // endregion

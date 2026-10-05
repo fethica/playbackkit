@@ -42,7 +42,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - product statements that do not touch recovery state are removed (listen tracking,
  *    progress persistence, repeat mode, artwork grants, loudness, metadata clearing, the
  *    item's give-up restart record, autoplay and timer bookkeeping);
- *  - the timer settle is stubbed to "nothing due", the veto is the same flag read through
+ *  - the timer settle is a seam the trace scripts ([settleDue]: nothing is due unless a
+ *    step makes the next settle due, and a due settle runs the host's stop), the veto is
+ *    the same flag read through
  *    the same pure predicate, the replacement-URI rule is the original pure rule over a
  *    scripted catalog, and the item kind and network come from the trace world;
  *  - the tracked-item check of the seek arm reads the id recorded by the transition arm,
@@ -58,6 +60,7 @@ internal class ReferenceRecovery(
     private val network: () -> Boolean,
     private val catalogUriFor: (String?) -> String?,
     private val log: MutableList<String>,
+    private val settleDue: (manualPlay: Boolean) -> Any? = { null },
 ) : RecoveryCallbacks {
 
     private val player: RecoveryPlayer? get() = port
@@ -89,7 +92,7 @@ internal class ReferenceRecovery(
     }
 
     // Stubs for the seams.
-    private fun settleDueSleepTimer(@Suppress("UNUSED_PARAMETER") manualPlay: Boolean): Any? = null
+    private fun settleDueSleepTimer(manualPlay: Boolean): Any? = settleDue(manualPlay)
     private fun sleepAllowsAutomaticStart(sleepStopActive: Boolean): Boolean = !sleepStopActive
     private fun currentItemIsFinite(): Boolean = kindOf(player?.currentMediaId) == ItemKind.FINITE
     private fun hasNetwork(): Boolean = network()
