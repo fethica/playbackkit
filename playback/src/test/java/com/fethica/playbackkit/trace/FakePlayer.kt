@@ -19,8 +19,13 @@ internal const val TRANSITION_REASON_SEEK = 2
  *  - listener events are queued and flushed the way `ListenerSet` does it: synchronously
  *    from inside the command that caused them, except that a command issued from inside a
  *    listener callback only queues its events, which run after the current one finishes;
- *  - within one update, events go out in Media3's order: item transition, position
- *    discontinuity, player error, playback state, playWhenReady, isPlaying;
+ *  - within one update, events go out in Media3's order (`ExoPlayerImpl.updatePlaybackInfo`
+ *    in 1.9.2): position discontinuity, item transition, player error, playback state,
+ *    playWhenReady, isPlaying;
+ *  - a current-item replace comes in two shapes: [updateMetadata] is Media3's in-place
+ *    update of an item whose URI is unchanged (the window keeps its identity and no item
+ *    transition is reported), [replaceUri] is a source replace that reports a
+ *    PLAYLIST_CHANGED transition for the same id unless [replaceReportsTransition] is off;
  *  - `play()` with playWhenReady already true reports nothing;
  *  - `stop()` moves to IDLE and keeps play intent and the last error; `prepare()` clears
  *    the error and moves IDLE to BUFFERING;
@@ -52,6 +57,8 @@ internal class FakePlayer(
 
     private val queue = ArrayDeque<() -> Unit>()
     private var flushing = false
+    private var holdingEvents = false
+    private var hostDepth = 0
 
     override val playbackState: Int get() = state
     override val playWhenReady: Boolean get() = pwr
@@ -75,12 +82,38 @@ internal class FakePlayer(
     var hostDriving: Boolean = false
 
     /**
-     * Commands the host issues directly are tagged `host`; commands issued from a listener
-     * callback or from delayed work are recovery's own and tagged `rec`.
+     * Commands the host issues directly, or inside [asHost], are tagged `host`; commands
+     * issued from a listener callback or from delayed work are recovery's own and tagged
+     * `rec`.
      */
     private fun cmd(text: String) {
-        val origin = if (hostDriving && !flushing) "host" else "rec"
+        val origin = if (hostDepth > 0 || (hostDriving && !flushing)) "host" else "rec"
         log += "t=${clock()} $origin $text"
+    }
+
+    /** Runs [block] as the host's own code, wherever it is called from (a listener, a timer). */
+    fun <T> asHost(block: () -> T): T {
+        hostDepth += 1
+        try {
+            return block()
+        } finally {
+            hostDepth -= 1
+        }
+    }
+
+    /**
+     * Runs [block] as if it were issued from inside a listener callback: the events of its
+     * commands are queued, then delivered in order after it, reading the player as it is
+     * by then.
+     */
+    fun inOneListenerTurn(block: () -> Unit) {
+        holdingEvents = true
+        try {
+            block()
+        } finally {
+            holdingEvents = false
+        }
+        flush()
     }
 
     // region Commands recovery may issue
@@ -135,6 +168,15 @@ internal class FakePlayer(
 
     // region Scripted world
 
+    /**
+     * `replaceMediaItem` with the URI unchanged, as a metadata or artwork refresh does:
+     * Media3 updates the item in place and reports no item transition.
+     */
+    fun updateMetadata() {
+        cmd("replaceMediaItem($index,metadata)")
+        update {}
+    }
+
     /** `setMediaItems([item])`: a PLAYLIST_CHANGED transition, even for the same id. */
     fun setItem(id: String, uri: String) {
         cmd("setMediaItems($id)")
@@ -188,8 +230,8 @@ internal class FakePlayer(
         val newState = state
         val newPwr = pwr
         val newPlaying = isPlayingNow()
-        if (transition != null) send { it.onMediaItemTransition(transition.first, transition.second) }
         if (discontinuity != null) send { it.onPositionDiscontinuity(discontinuity) }
+        if (transition != null) send { it.onMediaItemTransition(transition.first, transition.second) }
         if (error != null) send { it.onPlayerError(error.first, error.second, error.third) }
         if (newState != oldState) send { it.onPlaybackStateChanged(newState) }
         if (newPwr != oldPwr) send { it.onPlayWhenReadyChanged(newPwr, pwrReason) }
@@ -202,7 +244,7 @@ internal class FakePlayer(
     }
 
     private fun flush() {
-        if (flushing) return
+        if (flushing || holdingEvents) return
         flushing = true
         try {
             while (queue.isNotEmpty()) queue.removeFirst().invoke()
