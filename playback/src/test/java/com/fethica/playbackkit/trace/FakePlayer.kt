@@ -72,8 +72,21 @@ internal class FakePlayer(
     override val currentPosition: Long
         get() = basePositionMs + (accrueFromMs?.let { clock() - it } ?: 0L)
 
+    /**
+     * When set, every read of [currentItemToken] returns a fresh [TokenView] of the entry:
+     * equal to the previous read, never the same object, as a concatenated timeline does.
+     */
+    var freshTokenViews = false
+
+    /** Equal to another view of the same entry, never identical to it. */
+    class TokenView(val entry: Any) {
+        override fun equals(other: Any?): Boolean = other is TokenView && other.entry === entry
+        override fun hashCode(): Int = System.identityHashCode(entry)
+    }
+
     /** The entry itself: `setMediaItems` makes a new one, a URI replace keeps it. */
-    override val currentItemToken: Any? get() = items.getOrNull(index)
+    override val currentItemToken: Any?
+        get() = items.getOrNull(index)?.let { if (freshTokenViews) TokenView(it) else it }
 
     override fun mediaIdAt(index: Int): String? = items[index].id
     override fun uriAt(index: Int): String? = items[index].uri

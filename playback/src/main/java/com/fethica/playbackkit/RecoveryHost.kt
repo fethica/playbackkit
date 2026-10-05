@@ -66,6 +66,11 @@ public interface RecoveryHost {
      * failure's entry the player is read before this call too; a failure whose item was
      * chosen again (even with the same id), sought or paused here is dropped: recovery
      * pauses, stops, counts and reports nothing for it, and the new item is left alone.
+     * Recovery sees those commands through the player's getters, since their callbacks
+     * are queued behind the one running: a command that changes no getter, such as a seek
+     * to the current position of a player that is already IDLE, is not seen. A host that
+     * issues one here calls [PlaybackRecovery.cancelAutomaticWork] first, which drops the
+     * failure on its own.
      */
     public fun onBeforeAutomaticStart() {}
 

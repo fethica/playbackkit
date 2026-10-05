@@ -4,6 +4,7 @@ import com.fethica.playbackkit.ItemKind
 import com.fethica.playbackkit.LadderResetCause
 import com.fethica.playbackkit.RecoveryConfig
 import com.fethica.playbackkit.RecoveryEvent
+import com.fethica.playbackkit.RecoveryPolicy
 import com.fethica.playbackkit.STATE_READY
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -283,6 +284,78 @@ class LibraryTraceTest {
         assertTrue(result.finalPlayWhenReady)
         assertTrue(result.finalState.contains("player=READY"))
         assertTrue(result.finalState.contains("item=live_b"))
+    }
+
+    @Test fun `an unchanged item whose token reads as a fresh equal object still recovers`() {
+        val result = runTrace(Impl.LIBRARY) {
+            fake.freshTokenViews = true
+            select("finite_x")
+            ready()
+            advance(10_000)
+            val first = fake.currentItemToken
+            val second = fake.currentItemToken
+            assertEquals(first, second)
+            assertFalse(first === second)
+            error(2001)
+            assertEquals(1, libraryEngine.snapshot().finiteAttempts)
+            assertTrue(libraryEngine.snapshot().retryPending)
+            assertEquals(1, failureEvents.filterIsInstance<RecoveryEvent.RungScheduled>().size)
+            advance(RecoveryPolicy.retryDelayMs(1))
+            ready()
+            advance(1_000)
+        }
+        assertTrue(result.recoveryCommands().any { it.contains("prepare") })
+        assertEquals(emptyList<RecoveryEvent.GaveUp>(), result.events.filterIsInstance<RecoveryEvent.GaveUp>())
+    }
+
+    @Test fun `cancelAutomaticWork inside the pre-start call drops a failure its same-position seek would not reveal`() {
+        val result = runTrace(Impl.LIBRARY) {
+            select("finite_x")
+            ready()
+            advance(10_000)
+            repeat(3) { attempt ->
+                error(2001)
+                advance(RecoveryPolicy.retryDelayMs(attempt + 1))
+                ready()
+            }
+            assertEquals(3, libraryEngine.snapshot().finiteAttempts)
+            val commandsBefore = log.count { " rec " in it }
+            onBeforeStart = {
+                onBeforeStart = null
+                libraryEngine.cancelAutomaticWork()
+                fake.userSeek(fake.currentPosition)
+            }
+            error(2001)
+            assertEquals(commandsBefore, log.count { " rec " in it })
+            assertTrue(fake.playWhenReady)
+            advance(10_000)
+        }
+        assertEquals(emptyList<RecoveryEvent.GaveUp>(), result.events.filterIsInstance<RecoveryEvent.GaveUp>())
+        assertEquals(emptyList<String>(), result.reports())
+    }
+
+    @Test fun `a finite failure after a stable window starts a fresh ladder at the position reached`() {
+        val result = runTrace(Impl.LIBRARY) {
+            select("finite_x")
+            ready()
+            advance(10_000)
+            error(2001)
+            assertEquals(1, libraryEngine.snapshot().finiteAttempts)
+            advance(RecoveryPolicy.retryDelayMs(1))
+            ready()
+            advance(RecoveryPolicy.STABLE_PLAYBACK_MS + 1_000)
+            assertEquals(0, libraryEngine.snapshot().finiteAttempts)
+            val reached = fake.currentPosition
+            assertTrue(reached > 10_000)
+            error(2001)
+            assertEquals(1, libraryEngine.snapshot().finiteAttempts)
+            val rung = failureEvents.filterIsInstance<RecoveryEvent.RungScheduled>().last()
+            assertEquals(1, rung.attempt)
+            assertEquals(reached, rung.positionMs)
+            advance(RecoveryPolicy.retryDelayMs(1))
+            assertTrue(log.any { it.contains("rec seekTo(0,$reached)") })
+        }
+        assertEquals(emptyList<RecoveryEvent.GaveUp>(), result.events.filterIsInstance<RecoveryEvent.GaveUp>())
     }
 
     @Test fun `a seek inside the pre-start call at a failure's entry schedules no rung at the old position`() {

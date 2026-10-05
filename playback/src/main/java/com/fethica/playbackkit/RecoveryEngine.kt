@@ -408,7 +408,13 @@ internal class RecoveryEngine(
      * yet when the call returns. The player's getters have: a reselection, even of the
      * same id, gives the item a new [RecoveryPlayer.currentItemToken], a seek moves the
      * position or the state, and a pause clears play intent. Position is compared only for
-     * a player that is not playing, where it cannot move on its own.
+     * a player that is not playing, where it cannot move on its own. The token is compared
+     * by value: a concatenated timeline hands back a fresh but equal uid on every read, and
+     * a reselection still differs by value because the playlist entry behind it is new.
+     *
+     * A command that leaves every getter unchanged (a seek to the current position of a
+     * player that is already IDLE) is invisible here; its callback arrives after the
+     * decision. A host that issues one at entry calls [cancelAutomaticWork] first.
      */
     private inner class EntryState {
         val mediaId: String? = player.currentMediaId
@@ -424,7 +430,7 @@ internal class RecoveryEngine(
 
         fun stillHolds(): Boolean =
             stillCurrent(mediaId, playWhenReady, intent) &&
-                player.currentItemToken === itemToken &&
+                player.currentItemToken == itemToken &&
                 player.mediaItemCount == itemCount &&
                 player.currentMediaItemIndex == index &&
                 player.playbackState == playbackState &&

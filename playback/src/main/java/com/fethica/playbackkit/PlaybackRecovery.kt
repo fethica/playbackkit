@@ -206,7 +206,11 @@ internal class Media3RecoveryPlayer(private val player: Player) : RecoveryPlayer
 
     private val window = Timeline.Window()
 
-    /** The window uid: every `setMediaItems` entry gets a new one, applied at once. */
+    /**
+     * The window uid: every `setMediaItems` entry gets a new one, applied at once. Read it
+     * fresh each time and compare by value: a concatenated timeline allocates an equal pair
+     * for a nested window on every read, so identity would read an unchanged item as new.
+     */
     override val currentItemToken: Any?
         get() {
             val timeline = player.currentTimeline
