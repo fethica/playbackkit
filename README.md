@@ -147,7 +147,7 @@ The panel also shows each path's scenario and request count, the server address,
 
 ## Requirements
 
-- Android API 24+
+- Android 7.0+ (API 24); compileSdk 36
 - Media3 1.9.2
 
 ## License
